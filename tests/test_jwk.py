@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from jose import jwk
@@ -137,3 +139,76 @@ class TestJWK:
 
         with pytest.raises(TypeError):
             assert jwk.register_key("ALG", object)
+
+
+# JWK and expected thumbprint from RFC 7638, section 3.1.
+rfc7638_key = {
+    "kty": "RSA",
+    "n": (
+        "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_"
+        "BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_"
+        "FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI"
+        "4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+    ),
+    "e": "AQAB",
+    "alg": "RS256",
+    "kid": "2011-04-29",
+}
+rfc7638_thumbprint = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+
+
+class TestThumbprint:
+    @pytest.mark.skipif(RSAKey is None, reason="RSA is not available")
+    def test_rfc7638_example(self):
+        key = jwk.construct(rfc7638_key, algorithm="RS256")
+        assert key.thumbprint() == rfc7638_thumbprint
+
+    def test_hmac_thumbprint(self):
+        key = jwk.construct(hmac_key, algorithm="HS256")
+        expected = jwk.jwk_thumbprint(hmac_key)
+        assert key.thumbprint() == expected
+
+    def test_thumbprint_ignores_kid(self):
+        # The thumbprint identifies the key material, not the server-assigned
+        # kid, so two JWKs with different kids but the same material match.
+        other = dict(hmac_key, kid="some-other-kid")
+        assert jwk.jwk_thumbprint(other) == jwk.jwk_thumbprint(hmac_key)
+
+    def test_thumbprint_hash_alg(self):
+        thumbprint = jwk.jwk_thumbprint(hmac_key, hash_alg=hashlib.sha512)
+        assert thumbprint != jwk.jwk_thumbprint(hmac_key)
+        assert len(thumbprint) == 86  # base64url of 64 bytes, no padding
+
+    def test_thumbprint_unknown_kty(self):
+        with pytest.raises(JWKError):
+            jwk.jwk_thumbprint({"kty": "unknown"})
+
+    def test_thumbprint_missing_member(self):
+        with pytest.raises(JWKError):
+            jwk.jwk_thumbprint({"kty": "oct"})
+
+
+class TestGetKeyByThumbprint:
+    @pytest.mark.skipif(RSAKey is None, reason="RSA is not available")
+    def test_select_from_jwk_set(self):
+        jwk_set = {"keys": [hmac_key, rfc7638_key]}
+        assert jwk.get_key_by_thumbprint(jwk_set, rfc7638_thumbprint) == rfc7638_key
+
+    @pytest.mark.skipif(RSAKey is None, reason="RSA is not available")
+    def test_select_from_json_string(self):
+        import json
+
+        jwk_set = json.dumps({"keys": [hmac_key, rfc7638_key]})
+        assert jwk.get_key_by_thumbprint(jwk_set, rfc7638_thumbprint) == rfc7638_key
+
+    def test_select_key_instance(self):
+        key = jwk.construct(hmac_key, algorithm="HS256")
+        assert jwk.get_key_by_thumbprint([key], key.thumbprint()) is key
+
+    def test_select_single_jwk(self):
+        thumbprint = jwk.jwk_thumbprint(hmac_key)
+        assert jwk.get_key_by_thumbprint(hmac_key, thumbprint) == hmac_key
+
+    def test_no_match(self):
+        with pytest.raises(JWKError):
+            jwk.get_key_by_thumbprint({"keys": [hmac_key]}, "does-not-match")

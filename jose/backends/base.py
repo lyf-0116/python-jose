@@ -1,4 +1,48 @@
+import hashlib
+import json
+
+from ..exceptions import JWKError
 from ..utils import base64url_encode, ensure_binary
+
+# Required JWK members used to compute the RFC 7638 thumbprint, keyed by kty.
+_THUMBPRINT_MEMBERS = {
+    "EC": ("crv", "kty", "x", "y"),
+    "RSA": ("e", "kty", "n"),
+    "oct": ("k", "kty"),
+}
+
+
+def jwk_thumbprint(key_data, hash_alg=hashlib.sha256):
+    """Compute the thumbprint of a JWK as specified by RFC 7638.
+
+    Args:
+        key_data (dict): The JWK to compute the thumbprint of.
+        hash_alg (callable): A callable returning a hash object, e.g. hashlib.sha256
+
+    Returns:
+        str: The base64url encoded thumbprint of the key.
+    """
+    kty = key_data.get("kty")
+    try:
+        members = _THUMBPRINT_MEMBERS[kty]
+    except KeyError:
+        raise JWKError("Unable to compute a thumbprint for kty %r" % (kty,))
+
+    canonical = {}
+    for member in members:
+        try:
+            value = key_data[member]
+        except KeyError:
+            raise JWKError("Missing required JWK member %r for kty %r" % (member, kty))
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        canonical[member] = value
+
+    # RFC 7638 section 3: the required members, in lexicographic order,
+    # serialized to JSON with no whitespace.
+    serialized = json.dumps(canonical, separators=(",", ":"), sort_keys=True)
+    digest = hash_alg(serialized.encode("utf-8")).digest()
+    return base64url_encode(digest).decode("utf-8")
 
 
 class Key:
@@ -23,6 +67,21 @@ class Key:
 
     def to_dict(self):
         raise NotImplementedError()
+
+    def thumbprint(self, hash_alg=hashlib.sha256):
+        """Compute the thumbprint of this key as specified by RFC 7638.
+
+        The thumbprint is a stable identifier for the key material: it is
+        derived only from the required JWK members and is independent of
+        any server-assigned "kid".
+
+        Args:
+            hash_alg (callable): A callable returning a hash object, e.g. hashlib.sha256
+
+        Returns:
+            str: The base64url encoded thumbprint of the key.
+        """
+        return jwk_thumbprint(self.to_dict(), hash_alg=hash_alg)
 
     def encrypt(self, plain_text, aad=None):
         """
