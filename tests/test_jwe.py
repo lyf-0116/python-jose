@@ -7,7 +7,7 @@ from jose import jwe
 from jose.constants import ALGORITHMS, ZIPS
 from jose.exceptions import JWEError, JWEParseError
 from jose.jwk import AESKey, RSAKey
-from jose.utils import base64url_decode
+from jose.utils import base64url_decode, base64url_encode
 
 backends = []
 try:
@@ -71,6 +71,14 @@ OCT_192_BIT_KEY = b"\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xcek|\xd4-o
 OCT_256_BIT_KEY = b"\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xcek|\xd4-ok\t\xdb\xc8\xb1\x00\xf0\x8f\x9c,\xcf"
 OCT_384_BIT_KEY = b"\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xcek|\xd4-ok\t\xdb\xc8\xb1\x00\xf0\x8f\x9c,\xcf\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xce"
 OCT_512_BIT_KEY = b"\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xcek|\xd4-ok\t\xdb\xc8\xb1\x00\xf0\x8f\x9c,\xcf\x04\xd3\x1f\xc5T\x9d\xfc\xfe\x0bd\x9d\xfa?\xaaj\xcek|\xd4-ok\t\xdb\xc8\xb1\x00\xf0\x8f\x9c,\xcf"
+
+
+def oct_jwk(key, kid):
+    return {
+        "kty": "oct",
+        "kid": kid,
+        "k": base64url_encode(key).decode("ascii"),
+    }
 
 
 class TestGetUnverifiedHeader:
@@ -550,3 +558,71 @@ class TestEncrypt:
         with pytest.raises(JWEError) as excinfo:
             actual = jwe.decrypt(encrypted, PRIVATE_KEY_PEM)
         assert "Decompressed JWE string exceeds" in str(excinfo.value)
+
+
+@pytest.mark.skipif(AESKey is None, reason="No AES backend")
+class TestKeySets:
+    def setup_method(self):
+        self.enc = ALGORITHMS.A128GCM
+        self.alg = ALGORITHMS.A128KW
+        self.old_key = OCT_128_BIT_KEY
+        self.new_key = bytes(byte ^ 0xFF for byte in OCT_128_BIT_KEY)
+        self.old_jwk = oct_jwk(self.old_key, "old")
+        self.new_jwk = oct_jwk(self.new_key, "new")
+        self.jwk_set = {"keys": [self.old_jwk, self.new_jwk]}
+
+    def test_encrypt_selects_key_by_kid_and_writes_header(self):
+        encrypted = jwe.encrypt(b"Text", self.jwk_set, self.enc, self.alg, kid="new")
+
+        header = jwe.get_unverified_header(encrypted)
+        assert header["kid"] == "new"
+        assert jwe.decrypt(encrypted, self.jwk_set) == b"Text"
+
+    def test_encrypt_defaults_to_first_key_and_its_kid(self):
+        encrypted = jwe.encrypt(b"Text", self.jwk_set, self.enc, self.alg)
+
+        header = jwe.get_unverified_header(encrypted)
+        assert header["kid"] == "old"
+        assert jwe.decrypt(encrypted, self.jwk_set) == b"Text"
+
+    def test_encrypt_unknown_kid_raises(self):
+        with pytest.raises(JWEError):
+            jwe.encrypt(b"Text", self.jwk_set, self.enc, self.alg, kid="missing")
+
+    def test_decrypt_prefers_candidate_matching_header_kid(self):
+        encrypted = jwe.encrypt(b"Text", self.jwk_set, self.enc, self.alg, kid="new")
+
+        reordered = {"keys": [self.old_jwk, self.new_jwk]}
+        assert jwe.decrypt(encrypted, reordered) == b"Text"
+
+    def test_decrypt_tries_all_keys_when_header_has_no_kid(self):
+        encrypted = jwe.encrypt(b"Text", self.new_key, self.enc, self.alg)
+        assert "kid" not in jwe.get_unverified_header(encrypted)
+        assert jwe.decrypt(encrypted, self.jwk_set) == b"Text"
+
+    def test_decrypt_tries_all_keys_for_duplicate_kid(self):
+        same_kid_set = {
+            "keys": [
+                oct_jwk(self.new_key, "rotated"),
+                oct_jwk(self.old_key, "rotated"),
+            ]
+        }
+        encrypted = jwe.encrypt(b"Text", {"keys": [oct_jwk(self.old_key, "rotated")]}, self.enc, self.alg)
+
+        assert jwe.get_unverified_header(encrypted)["kid"] == "rotated"
+        assert jwe.decrypt(encrypted, same_kid_set) == b"Text"
+
+    def test_key_set_as_json_and_kid_mapping(self):
+        encrypted = jwe.encrypt(b"Text", json.dumps(self.jwk_set), self.enc, self.alg, kid="old")
+        assert jwe.decrypt(encrypted, json.dumps(self.jwk_set)) == b"Text"
+
+        mapping = {"old": self.old_key, "new": self.new_key}
+        encrypted = jwe.encrypt(b"Text", mapping, self.enc, self.alg, kid="new")
+        assert jwe.get_unverified_header(encrypted)["kid"] == "new"
+        assert jwe.decrypt(encrypted, mapping) == b"Text"
+
+    def test_direct_key_set(self):
+        direct_keys = {"keys": [oct_jwk(self.old_key, "old"), oct_jwk(self.new_key, "new")]}
+        encrypted = jwe.encrypt(b"Text", direct_keys, self.enc, ALGORITHMS.DIR, kid="new")
+
+        assert jwe.decrypt(encrypted, direct_keys) == b"Text"

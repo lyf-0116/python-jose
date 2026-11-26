@@ -2,14 +2,15 @@ import binascii
 import json
 
 try:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Mapping
 except ImportError:
-    from collections import Mapping, Iterable
+    from collections import Mapping
 
 from jose import jwk
 from jose.backends.base import Key
 from jose.constants import ALGORITHMS
 from jose.exceptions import JWSError, JWSSignatureError
+from jose.jwk import _get_keys
 from jose.utils import base64url_decode, base64url_encode
 
 
@@ -216,38 +217,6 @@ def _sig_matches_keys(keys, signing_input, signature, alg):
         except Exception:
             pass
     return False
-
-
-def _get_keys(key):
-    if isinstance(key, Key):
-        return (key,)
-
-    try:
-        key = json.loads(key, parse_int=str, parse_float=str)
-    except Exception:
-        pass
-
-    if isinstance(key, Mapping):
-        if "keys" in key:
-            # JWK Set per RFC 7517
-            return key["keys"]
-        elif "kty" in key:
-            # Individual JWK per RFC 7517
-            return (key,)
-        else:
-            # Some other mapping. Firebase uses just dict of kid, cert pairs
-            values = key.values()
-            if values:
-                return values
-            return (key,)
-
-    # Iterable but not text or mapping => list- or tuple-like
-    elif isinstance(key, Iterable) and not (isinstance(key, str) or isinstance(key, bytes)):
-        return key
-
-    # Scalar value, wrap in tuple.
-    else:
-        return (key,)
 
 
 def _verify_signature(signing_input, header, signature, key="", algorithms=None):

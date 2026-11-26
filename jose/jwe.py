@@ -6,8 +6,10 @@ from struct import pack
 
 from . import jwk
 from .backends import get_random_bytes
+from .backends.base import Key
 from .constants import ALGORITHMS, JWE_SIZE_LIMIT, ZIPS
 from .exceptions import JWEError, JWEParseError
+from .jwk import _get_keys
 from .utils import base64url_decode, base64url_encode, ensure_binary
 
 
@@ -17,7 +19,8 @@ def encrypt(plaintext, key, encryption=ALGORITHMS.A256GCM, algorithm=ALGORITHMS.
     Args:
         plaintext (bytes): A bytes object to encrypt
         key (str or dict): The key(s) to use for encrypting the content. Can be
-            individual JWK or JWK set.
+            an individual key, JWK, JWK set, or an iterable of keys. When a key
+            set is supplied, ``kid`` selects the recipient key.
         encryption (str, optional): The content encryption algorithm used to
             perform authenticated encryption on the plaintext to produce the
             ciphertext and the Authentication Tag.  Defaults to A256GCM.
@@ -47,8 +50,12 @@ def encrypt(plaintext, key, encryption=ALGORITHMS.A256GCM, algorithm=ALGORITHMS.
         raise JWEError("Algorithm %s not supported." % algorithm)
     if encryption not in ALGORITHMS.SUPPORTED:
         raise JWEError("Algorithm %s not supported." % encryption)
-    key = jwk.construct(key, algorithm)
-    encoded_header = _encoded_header(algorithm, encryption, zip, cty, kid)
+
+    key, key_id = _select_encryption_key(key, kid)
+    if not isinstance(key, Key):
+        key = jwk.construct(key, algorithm)
+
+    encoded_header = _encoded_header(algorithm, encryption, zip, cty, key_id)
 
     plaintext = _compress(zip, plaintext)
     enc_cek, iv, cipher_text, auth_tag = _encrypt_and_auth(key, algorithm, encryption, zip, plaintext, encoded_header)
@@ -57,13 +64,50 @@ def encrypt(plaintext, key, encryption=ALGORITHMS.A256GCM, algorithm=ALGORITHMS.
     return jwe_string
 
 
+def _select_encryption_key(key, kid):
+    """Select the recipient key and the identifier to place in the header.
+
+    Args:
+        key: A key or key set accepted by :func:`jose.jwk.get_keys`.
+        kid (str, optional): Recipient identifier used to select a key.
+
+    Returns:
+        tuple: ``(key, key_id)`` where ``key_id`` is the explicit ``kid`` when
+        supplied, otherwise the selected key's own identifier.
+
+    Raises:
+        JWEError: If a ``kid`` was supplied and cannot be resolved, or if the
+            supplied key collection is empty.
+    """
+    if kid is not None:
+        matching = jwk.get_keys_by_kid(key, kid)
+        if matching:
+            return matching[0], kid
+
+        # Preserve the historical behaviour of using an explicit kid as a
+        # header label for a single raw key that has no identifier of its own.
+        keys = list(_get_keys(key))
+        if len(keys) == 1 and jwk.get_key_id(keys[0]) is None:
+            return keys[0], kid
+
+        raise JWEError("No key found matching kid %r" % (kid,))
+
+    keys = list(_get_keys(key))
+    if not keys:
+        raise JWEError("No key available for encryption")
+
+    selected = keys[0]
+    return selected, jwk.get_key_id(selected)
+
+
 def decrypt(jwe_str, key):
     """Decrypts a JWE compact serialized string and returns the plaintext.
 
     Args:
         jwe_str (str): A JWE to be decrypt.
-        key (str or dict): A key to attempt to decrypt the payload with. Can be
-            individual JWK or JWK set.
+        key (str or dict): A key or key set to attempt to decrypt the payload
+            with. When a key set is supplied, the protected header's ``kid``
+            selects the preferred candidates.
 
     Returns:
         bytes: The plaintext bytes, assuming the authentication tag is valid.
@@ -104,59 +148,10 @@ def decrypt(jwe_str, key):
     except KeyError:
         raise JWEParseError("alg and enc headers are required!")
 
-    # Verify that the JWE uses a key known to the recipient.
-    key = jwk.construct(key, alg)
-
-    # When Direct Key Agreement or Key Agreement with Key Wrapping are
-    # employed, use the key agreement algorithm to compute the value
-    # of the agreed upon key.  When Direct Key Agreement is employed,
-    # let the CEK be the agreed upon key.  When Key Agreement with Key
-    # Wrapping is employed, the agreed upon key will be used to
-    # decrypt the JWE Encrypted Key.
-    #
-    # When Key Wrapping, Key Encryption, or Key Agreement with Key
-    # Wrapping are employed, decrypt the JWE Encrypted Key to produce
-    # the CEK.  The CEK MUST have a length equal to that required for
-    # the content encryption algorithm.  Note that when there are
-    # multiple recipients, each recipient will only be able to decrypt
-    # JWE Encrypted Key values that were encrypted to a key in that
-    # recipient's possession.  It is therefore normal to only be able
-    # to decrypt one of the per-recipient JWE Encrypted Key values to
-    # obtain the CEK value.  Also, see Section 11.5 for security
-    # considerations on mitigating timing attacks.
-    if alg == ALGORITHMS.DIR:
-        # When Direct Key Agreement or Direct Encryption are employed,
-        # verify that the JWE Encrypted Key value is an empty octet
-        # sequence.
-
-        # Record whether the CEK could be successfully determined for this
-        # recipient or not.
-        cek_valid = encrypted_key == b""
-
-        # When Direct Encryption is employed, let the CEK be the shared
-        # symmetric key.
-        cek_bytes = _get_key_bytes_from_key(key)
-    else:
-        try:
-            cek_bytes = key.unwrap_key(encrypted_key)
-
-            # Record whether the CEK could be successfully determined for this
-            # recipient or not.
-            cek_valid = True
-        except NotImplementedError:
-            raise JWEError(f"alg {alg} is not implemented")
-        except Exception:
-            # Record whether the CEK could be successfully determined for this
-            # recipient or not.
-            cek_valid = False
-
-            # To mitigate the attacks described in RFC 3218 [RFC3218], the
-            # recipient MUST NOT distinguish between format, padding, and length
-            # errors of encrypted keys.  It is strongly recommended, in the event
-            # of receiving an improperly formatted key, that the recipient
-            # substitute a randomly generated CEK and proceed to the next step, to
-            # mitigate timing attacks.
-            cek_bytes = _get_random_cek_bytes_for_enc(enc)
+    # The protected header is available before the content is decrypted, so
+    # use its "kid" to order the candidate keys.  If the header has no usable
+    # identifier, every supplied key remains a candidate.
+    candidates = jwk.get_key_candidates(key, header.get("kid"))
 
     # Compute the Encoded Protected Header value BASE64URL(UTF8(JWE
     # Protected Header)).  If the JWE Protected Header is not present
@@ -173,27 +168,61 @@ def decrypt(jwe_str, key):
     # BASE64URL(JWE AAD)).
     aad = protected_header
 
-    # Decrypt the JWE Ciphertext using the CEK, the JWE Initialization
-    # Vector, the Additional Authenticated Data value, and the JWE
-    # Authentication Tag (which is the Authentication Tag input to the
-    # calculation) using the specified content encryption algorithm,
-    # returning the decrypted plaintext and validating the JWE
-    # Authentication Tag in the manner specified for the algorithm,
-    # rejecting the input without emitting any decrypted output if the
-    # JWE Authentication Tag is incorrect.
-    try:
-        plain_text = _decrypt_and_auth(cek_bytes, enc, cipher_text, iv, aad, auth_tag)
-    except NotImplementedError:
-        raise JWEError(f"enc {enc} is not implemented")
-    except Exception as e:
-        raise JWEError(e)
+    last_error = None
+    for candidate in candidates:
+        try:
+            if not isinstance(candidate, Key):
+                candidate = jwk.construct(candidate, alg)
 
-    # If a "zip" parameter was included, uncompress the decrypted
-    # plaintext using the specified compression algorithm.
-    if plain_text is not None:
+            # When Direct Key Agreement or Key Agreement with Key Wrapping are
+            # employed, use the key agreement algorithm to compute the value
+            # of the agreed upon key.  When Direct Key Agreement is employed,
+            # let the CEK be the agreed upon key.  When Key Agreement with Key
+            # Wrapping is employed, the agreed upon key will be used to
+            # decrypt the JWE Encrypted Key.
+            #
+            # When Key Wrapping, Key Encryption, or Key Agreement with Key
+            # Wrapping are employed, decrypt the JWE Encrypted Key to produce
+            # the CEK.  The CEK MUST have a length equal to that required for
+            # the content encryption algorithm.
+            if alg == ALGORITHMS.DIR:
+                # When Direct Encryption is employed, the encrypted key must
+                # be an empty octet sequence and the shared key is the CEK.
+                if encrypted_key != b"":
+                    last_error = JWEError("Invalid JWE Encrypted Key")
+                    continue
+                cek_bytes = _get_key_bytes_from_key(candidate)
+            else:
+                try:
+                    cek_bytes = candidate.unwrap_key(encrypted_key)
+                except NotImplementedError:
+                    raise JWEError(f"alg {alg} is not implemented")
+
+            # Decrypt the JWE Ciphertext using the CEK, the JWE Initialization
+            # Vector, the Additional Authenticated Data value, and the JWE
+            # Authentication Tag (which is the Authentication Tag input to the
+            # calculation) using the specified content encryption algorithm,
+            # returning the decrypted plaintext and validating the JWE
+            # Authentication Tag in the manner specified for the algorithm,
+            # rejecting the input without emitting any decrypted output if the
+            # JWE Authentication Tag is incorrect.
+            plain_text = _decrypt_and_auth(cek_bytes, enc, cipher_text, iv, aad, auth_tag)
+        except NotImplementedError:
+            raise JWEError(f"enc {enc} is not implemented")
+        except Exception as e:
+            # A key may be the wrong member of a key set, have the wrong type,
+            # or fail to unwrap/authenticate the CEK.  Keep trying candidates.
+            last_error = e
+            continue
+
+        # If a "zip" parameter was included, uncompress the decrypted
+        # plaintext using the specified compression algorithm.
         plain_text = _decompress(header.get("zip"), plain_text)
+        return plain_text
 
-    return plain_text if cek_valid else None
+    if last_error is not None:
+        raise JWEError(last_error)
+    raise JWEError("No key found to decrypt JWE")
 
 
 def get_unverified_header(jwe_str):

@@ -69,3 +69,21 @@ Decrypting Payloads
         >>> from jose import jwe
         >>> jwe.decrypt('eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4R0NNIn0..McILMB3dYsNJSuhcDzQshA.OfX9H_mcUpHDeRM4IA.CcnTWqaqxNsjT4eCaUABSg', 'asecret128bitkey')
         'Hello, World!'
+
+
+Using Key Sets
+--------------
+
+``jwe.encrypt`` and ``jwe.decrypt`` accept the same key shapes as the signing
+APIs: an individual key, a JWK, a JWK set (mapping or JSON string), or an
+iterable of keys.  When encrypting with a key set, ``kid`` selects the
+recipient key and the selected key's ``kid`` is written to the protected
+header automatically if it is not supplied explicitly.
+
+.. code:: python
+
+        >>> jwe.encrypt(payload, jwk_set, algorithm='A128KW', kid='2026-11')
+
+During key rotation, pass the whole key set to ``jwe.decrypt``.  The header's
+``kid`` is used to choose the preferred candidates; keys without a usable
+identifier are still tried so older tokens remain decryptable.
