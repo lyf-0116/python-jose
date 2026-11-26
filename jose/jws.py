@@ -9,7 +9,8 @@ except ImportError:
 from jose import jwk
 from jose.backends.base import Key
 from jose.constants import ALGORITHMS
-from jose.exceptions import JWSError, JWSSignatureError
+from jose.exceptions import JOSEError, JWSError, JWSSignatureError
+from jose.headers import merge_headers, reject_duplicate_json_members
 from jose.utils import base64url_decode, base64url_encode
 
 
@@ -72,6 +73,15 @@ def verify(token, key, algorithms, verify=True):
     """
 
     header, payload, signing_input, signature = _load(token)
+
+    # Merge the Protected Header with any unprotected header sources through
+    # the single validation gate so that duplicate parameter names and
+    # critical ("crit") extensions are enforced uniformly. With the Compact
+    # Serialization only the Protected Header exists.
+    try:
+        header = merge_headers(header)
+    except JOSEError as e:
+        raise JWSError(str(e))
 
     if verify:
         _verify_signature(signing_input, header, signature, key, algorithms)
@@ -186,9 +196,11 @@ def _load(jwt):
         raise JWSError("Invalid header padding")
 
     try:
-        header = json.loads(header_data.decode("utf-8"))
+        header = json.loads(header_data.decode("utf-8"), object_pairs_hook=reject_duplicate_json_members)
     except ValueError as e:
         raise JWSError("Invalid header string: %s" % e)
+    except JOSEError as e:
+        raise JWSError(str(e))
 
     if not isinstance(header, Mapping):
         raise JWSError("Invalid header string: must be a json object")

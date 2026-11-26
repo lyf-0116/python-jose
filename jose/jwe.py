@@ -7,7 +7,8 @@ from struct import pack
 from . import jwk
 from .backends import get_random_bytes
 from .constants import ALGORITHMS, JWE_SIZE_LIMIT, ZIPS
-from .exceptions import JWEError, JWEParseError
+from .exceptions import JOSEError, JWEError, JWEParseError
+from .headers import merge_headers, reject_duplicate_json_members
 from .utils import base64url_decode, base64url_encode, ensure_binary
 
 
@@ -84,6 +85,18 @@ def decrypt(jwe_str, key):
         raise JWEError(f"JWE string {len(jwe_str)} bytes exceeds {JWE_SIZE_LIMIT} bytes")
 
     header, encoded_header, encrypted_key, iv, cipher_text, auth_tag = _jwe_compact_deserialize(jwe_str)
+
+    # Merge the Protected Header, the Shared Unprotected Header and the
+    # Per-Recipient Unprotected Header (when present) through the single
+    # validation gate. With the Compact Serialization only the Protected
+    # Header exists, but it still goes through the same gate so that critical
+    # extensions are enforced on every merge path.
+    try:
+        header = merge_headers(header)
+    except JWEError:
+        raise
+    except JOSEError as e:
+        raise JWEError(str(e))
 
     # Verify that the implementation understands and can process all
     # fields that it is required to support, whether required by this
@@ -304,9 +317,11 @@ def _jwe_compact_deserialize(jwe_bytes):
     # values that together comprise the JOSE Header.
 
     try:
-        header = json.loads(header_data)
+        header = json.loads(header_data, object_pairs_hook=reject_duplicate_json_members)
     except ValueError as e:
         raise JWEParseError(f"Invalid header string: {e}")
+    except JOSEError as e:
+        raise JWEParseError(str(e))
 
     if not isinstance(header, Mapping):
         raise JWEParseError("Invalid header string: must be a json object")
